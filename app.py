@@ -11,6 +11,8 @@ Endpoints:
   GET  /schwab/quotes      — live quotes: ?symbols=HTZ,FOXA,WMT,GME
   GET  /schwab/level2      — Level 2 order book: ?symbol=HTZ
   GET  /schwab/keepalive   — silent token refresh (called by daily cron)
+  GET  /schwab/positions   — all open positions across all accounts
+  GET  /schwab/accounts    — account balances (net liq, buying power, P/L)
   GET  /privacy             — BMCMS LLC Privacy Policy (public, for Twilio A2P)
   GET  /terms               — BMCMS LLC Terms of Service (public, for Twilio A2P)
 
@@ -41,6 +43,7 @@ SCHWAB_CALLBACK_URL   = os.environ.get("SCHWAB_CALLBACK_URL", "https://web-produ
 SCHWAB_AUTH_URL    = "https://api.schwabapi.com/v1/oauth/authorize"
 SCHWAB_TOKEN_URL   = "https://api.schwabapi.com/v1/oauth/token"
 SCHWAB_MARKET_URL  = "https://api.schwabapi.com/marketdata/v1"
+SCHWAB_TRADER_URL  = "https://api.schwabapi.com/trader/v1"
 
 # Token stored in memory (Railway persists env vars; token refreshed in-process)
 _token_store = {}
@@ -258,6 +261,130 @@ def schwab_quotes():
         }
 
     return jsonify(result), 200
+
+
+@app.route("/schwab/positions")
+def schwab_positions():
+    """
+    All open positions across all accounts.
+    Returns simplified position data: symbol, qty, avg price, current value, P/L open, P/L day.
+    """
+    try:
+        access_token = get_valid_token()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 401
+
+    # First get account numbers
+    resp = requests.get(
+        f"{SCHWAB_TRADER_URL}/accounts/accountNumbers",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return jsonify({"error": f"accountNumbers {resp.status_code}", "detail": resp.text}), resp.status_code
+
+    account_numbers = resp.json()  # [{"accountNumber": "...", "hashValue": "..."}]
+
+    all_positions = []
+    for acct in account_numbers:
+        hash_val = acct.get("hashValue")
+        acct_num = acct.get("accountNumber")
+        if not hash_val:
+            continue
+
+        r = requests.get(
+            f"{SCHWAB_TRADER_URL}/accounts/{hash_val}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"fields": "positions"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            continue
+
+        data = r.json()
+        acct_data = data.get("securitiesAccount", data)
+        positions = acct_data.get("positions", [])
+        acct_type = acct_data.get("type", "UNKNOWN")
+        current_balances = acct_data.get("currentBalances", {})
+
+        for pos in positions:
+            instrument = pos.get("instrument", {})
+            symbol     = instrument.get("symbol", "")
+            asset_type = instrument.get("assetType", "")
+            desc       = instrument.get("description", "")
+
+            all_positions.append({
+                "account":        acct_num[-4:] if acct_num else "????",  # last 4 only
+                "account_type":   acct_type,
+                "symbol":         symbol,
+                "asset_type":     asset_type,
+                "description":    desc,
+                "qty":            pos.get("longQuantity", 0) or pos.get("shortQuantity", 0),
+                "avg_price":      pos.get("averagePrice"),
+                "market_value":   pos.get("marketValue"),
+                "pl_open":        pos.get("longOpenProfitLoss") or pos.get("openProfitLoss"),
+                "pl_day":         pos.get("currentDayProfitLoss"),
+                "pl_day_pct":     pos.get("currentDayProfitLossPercentage"),
+                "current_price":  pos.get("currentDayProfitLoss"),  # calculated below
+                "net_liq":        current_balances.get("liquidationValue"),
+            })
+
+    return jsonify({"positions": all_positions, "count": len(all_positions)}), 200
+
+
+@app.route("/schwab/accounts")
+def schwab_accounts():
+    """
+    Account balances: net liq, buying power, cash, P/L day, P/L open.
+    """
+    try:
+        access_token = get_valid_token()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 401
+
+    resp = requests.get(
+        f"{SCHWAB_TRADER_URL}/accounts/accountNumbers",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        return jsonify({"error": f"accountNumbers {resp.status_code}", "detail": resp.text}), resp.status_code
+
+    account_numbers = resp.json()
+    result = []
+
+    for acct in account_numbers:
+        hash_val = acct.get("hashValue")
+        acct_num = acct.get("accountNumber")
+        if not hash_val:
+            continue
+
+        r = requests.get(
+            f"{SCHWAB_TRADER_URL}/accounts/{hash_val}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            continue
+
+        data  = r.json()
+        sa    = data.get("securitiesAccount", data)
+        cb    = sa.get("currentBalances", {})
+        ib    = sa.get("initialBalances", {})
+
+        result.append({
+            "account":          acct_num[-4:] if acct_num else "????",
+            "type":             sa.get("type", "UNKNOWN"),
+            "net_liq":          cb.get("liquidationValue"),
+            "buying_power":     cb.get("buyingPower") or cb.get("availableFunds"),
+            "cash_available":   cb.get("cashAvailableForTrading"),
+            "pl_day":           cb.get("dayTradingBuyingPower"),  # will be overridden
+            "equity":           cb.get("equity"),
+            "long_market_value":cb.get("longMarketValue"),
+            "short_market_value":cb.get("shortMarketValue"),
+        })
+
+    return jsonify({"accounts": result}), 200
 
 
 @app.route("/schwab/level2")
