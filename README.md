@@ -35,3 +35,4 @@ Should return a full quote + notification body for HTZ.
 
 ## Health Check
 `https://your-app.railway.app/health`
+# v2 deployed Sun Jun 14 17:12:02 UTC 2026
